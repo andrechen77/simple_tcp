@@ -3,7 +3,6 @@ from lossy_socket import LossyUDP
 # do not import anything else from socket except INADDR_ANY
 from socket import INADDR_ANY
 
-
 class Streamer:
     def __init__(self, dst_ip, dst_port,
                  src_ip=INADDR_ANY, src_port=0):
@@ -19,12 +18,16 @@ class Streamer:
         # Your code goes here!  The code below should be changed!
 
         # for now I'm just sending the raw application-level data in one UDP payload
-        self.socket.sendto(data_bytes, (self.dst_ip, self.dst_port))
+
+        packet_size = 1472
+        for start in range(0, len(data_bytes), packet_size):
+            packet = data_bytes[start:(start+packet_size)]
+            self.socket.sendto(packet, (self.dst_ip, self.dst_port))
 
     def recv(self) -> bytes:
         """Blocks (waits) if no data is ready to be read from the connection."""
         # your code goes here!  The code below should be changed!
-        
+
         # this sample code just calls the recvfrom method on the LossySocket
         data, addr = self.socket.recvfrom()
         # For now, I'll just pass the full UDP payload to the app
