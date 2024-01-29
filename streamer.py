@@ -3,6 +3,7 @@ from lossy_socket import LossyUDP
 # do not import anything else from socket except INADDR_ANY
 from socket import INADDR_ANY
 import struct
+from concurrent.futures import ThreadPoolExecutor
 
 packet_size = 1472
 packet_header_format = "!I"
@@ -24,6 +25,10 @@ class Streamer:
         self.recv_buff = [None for _ in range(self.recv_buff_size)]
         self.recv_seq_num = 0
         self.send_seq_num = 0
+        self.closed = False
+
+        executor = ThreadPoolExecutor(max_workers=1)
+        executor.submit(self.listener)
 
     def packetize(self, data_bytes):
         """Given a byte-array, iteratively returns the array transformed into packets."""
@@ -50,26 +55,37 @@ class Streamer:
     def recv(self) -> bytes:
         """Blocks (waits) if no data is ready to be read from the connection."""
 
-        while True:
-            packet, addr = self.socket.recvfrom()
-            assert(len(packet) <= packet_size) # pretty sure self.socket.recvfrom() returns only one packet
-            seq_num, data = self.unpacketize(packet)
-            if self.recv_seq_num <= seq_num and seq_num < self.recv_seq_num + self.recv_buff_size:
-                # the received packet can fit within the next recv_buff_size packets
-                self.recv_buff[seq_num % self.recv_buff_size] = data
-                if seq_num == self.recv_seq_num:
-                    break
-            # if the received packet can't fit or was already transmitted to the application, then drop it
-
         result = b''
-        while self.recv_buff[(i := self.recv_seq_num % self.recv_buff_size)] is not None:
+        while self.recv_buff[(i := self.recv_seq_num % self.recv_buff_size)] is not None or not result:
+            if self.recv_buff[i] is None:
+                # sleep?
+                continue
+            self.recv_seq_num += 1 # this happens before we modify recv_buff so that the listener thread never replaces a packet that's being removed
             result += self.recv_buff[i]
             self.recv_buff[i] = None
-            self.recv_seq_num += 1
         return result
+
+    def listener(self):
+        while not self.closed: # a later hint will explain self.closed
+            try:
+                packet, addr = self.socket.recvfrom()
+                if len(packet) == 0:
+                    # the socket died
+                    break
+                assert(len(packet) <= packet_size) # pretty sure self.socket.recvfrom() returns only one packet
+                seq_num, data = self.unpacketize(packet)
+                if self.recv_seq_num <= seq_num and seq_num < self.recv_seq_num + self.recv_buff_size:
+                    # the received packet can fit within the next recv_buff_size packets
+                    self.recv_buff[seq_num % self.recv_buff_size] = data
+                # if the received packet can't fit or was already transmitted to the application, then drop it
+            except Exception as e:
+                print("listener died!")
+                print(e)
+
 
     def close(self) -> None:
         """Cleans up. It should block (wait) until the Streamer is done with all
            the necessary ACKs and retransmissions"""
         # your code goes here, especially after you add ACKs and retransmissions.
-        pass
+        self.closed = True
+        self.socket.stoprecv()
