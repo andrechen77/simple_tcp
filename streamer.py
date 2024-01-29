@@ -5,12 +5,15 @@ from socket import INADDR_ANY
 import struct
 from concurrent.futures import ThreadPoolExecutor
 import time
+import threading
 
+ack_timeout = 0.25
 packet_size = 1472
 packet_header_format = "!Ic"
 packet_header_size = struct.calcsize(packet_header_format)
 payload_size = packet_size - packet_header_size
 assert(payload_size > 0)
+
 # big-endian byte-ordering
 # 32-bit sequence number, packet type ('D', 'A', or 'F')
 
@@ -28,6 +31,7 @@ class Streamer:
         self.recv_seq_num = 0
         self.send_seq_num = 0 # the sequence number of the next packet to be sent
         self.send_ack_num = 0 # the sequence number of next packet that is awaiting acknowledgement
+        self.send_got_ack = threading.Event()
         self.closed = False
 
         executor = ThreadPoolExecutor(max_workers=1)
@@ -49,13 +53,29 @@ class Streamer:
         payload = packet[packet_header_size:]
         return (seq_num, packet_type), payload
 
+    def send_packet(self, packet: bytes) -> None:
+        # self.socket.sendto(packet, (self.dst_ip, self.dst_port))
+        # print("attempt made at packet", packet)
+        # t = threading.Timer(ack_timeout, lambda: self.send_packet(packet))
+        # t.start()
+        # while self.send_seq_num > self.send_ack_num:
+        #     time.sleep(0.01)
+        # t.cancel()
+        while True:
+            self.socket.sendto(packet, (self.dst_ip, self.dst_port))
+            if self.send_got_ack.wait(timeout=ack_timeout):
+                # packet was succesfully acknowledged
+                self.send_got_ack.clear()
+                break
+            else:
+                # timeout occurred, resend
+                pass
+
     def send(self, data_bytes: bytes) -> None:
         """Note that data_bytes can be larger than one packet."""
 
         for packet in self.packetize(data_bytes):
-            self.socket.sendto(packet, (self.dst_ip, self.dst_port))
-            while self.send_seq_num > self.send_ack_num:
-                time.sleep(0.01)
+            self.send_packet(packet)
 
     def recv(self) -> bytes:
         """Blocks (waits) if no data is ready to be read from the connection."""
@@ -81,14 +101,17 @@ class Streamer:
                 headers, data = self.unpacketize(packet)
                 seq_num, packet_type = headers
                 if packet_type == b'D':
-                    if self.recv_seq_num <= seq_num and seq_num < self.recv_seq_num + self.recv_buff_size:
-                        # the received packet can fit within the next recv_buff_size packets
-                        self.recv_buff[seq_num % self.recv_buff_size] = data
+                    if seq_num < self.recv_seq_num + self.recv_buff_size:
+                        if self.recv_seq_num <= seq_num:
+                            # the received packet can fit within the next recv_buff_size packets
+                            self.recv_buff[seq_num % self.recv_buff_size] = data
+                        # acknowledge packet even if we already received it (maybe our ACK got lost)
                         ack = struct.pack(packet_header_format, seq_num, b'A') # no payload
                         self.socket.sendto(ack, (self.dst_ip, self.dst_port))
                     # if the received packet can't fit or was already transmitted to the application, then drop it
                 elif packet_type == b'A':
                     if seq_num >= self.send_ack_num:
+                        self.send_got_ack.set()
                         # TODO what about the previous packets? can we guarantee if they ACK packet 8 that packet 7 was received?
                         self.send_ack_num = seq_num + 1
                 elif packet_type == b'F':
