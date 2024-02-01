@@ -32,6 +32,7 @@ class Streamer:
         self.send_seq_num = 0 # the sequence number of the next packet to be sent
         self.send_ack_num = 0 # the sequence number of next packet that is awaiting acknowledgement
         self.send_got_ack = threading.Event()
+        self.got_fin = threading.Event()
         self.closed = False
 
         executor = ThreadPoolExecutor(max_workers=1)
@@ -54,6 +55,7 @@ class Streamer:
         return (seq_num, packet_type), payload
 
     def send_packet(self, packet: bytes) -> None:
+        """blocks until the packet is ACK'ed"""
         # self.socket.sendto(packet, (self.dst_ip, self.dst_port))
         # print("attempt made at packet", packet)
         # t = threading.Timer(ack_timeout, lambda: self.send_packet(packet))
@@ -112,12 +114,15 @@ class Streamer:
                 elif packet_type == b'A':
                     if seq_num >= self.send_ack_num:
                         self.send_got_ack.set()
-                        # TODO what about the previous packets? can we guarantee if they ACK packet 8 that packet 7 was received?
                         self.send_ack_num = seq_num + 1
                 elif packet_type == b'F':
-                    pass
+                    self.got_fin.set()
+                    # acknowledge packet even if we already received it (maybe our ACK got lost)
+                    ack = struct.pack(packet_header_format, seq_num, b'A') # no payload
+                    self.socket.sendto(ack, (self.dst_ip, self.dst_port))
+                    print("got fin")
                 else:
-                    pass
+                    raise Exception(f"unknown packet type: {packet_type}")
             except Exception as e:
                 print("listener died!")
                 print(e)
@@ -126,6 +131,19 @@ class Streamer:
     def close(self) -> None:
         """Cleans up. It should block (wait) until the Streamer is done with all
            the necessary ACKs and retransmissions"""
-        # your code goes here, especially after you add ACKs and retransmissions.
+        # TODO at part 5 [Wait for any sent data packets to be ACKed. Actually, if you're doing stop-and-wait then you know all of your sent data has been ACKed. However, in Part 5 you'll add code to maybe wait here.]
+        # Send a FIN packet.
+        fin = struct.pack(packet_header_format, self.send_seq_num, b'F') # no payload
+        # Wait for an ACK of the FIN packet. Go back to Step 2 if a timer expires.
+        print("starting to send fin")
+        self.send_packet(fin) # blocks until ACK'ed
+        print("finished fin")
+        # Wait until the listener records that a FIN packet was received from the other side.
+        self.got_fin.wait() # blocks forever until a FIN comes TODO can we not???
+        # Wait two seconds.
+        time.sleep(2.0)
+        # Stop the listener thread with self.closed = True and self.socket.stoprecv()
         self.closed = True
         self.socket.stoprecv()
+        # Finally, return from Streamer#close
+        return
