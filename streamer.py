@@ -7,6 +7,12 @@ from concurrent.futures import ThreadPoolExecutor
 import time
 import threading
 import hashlib
+import logging
+
+logging.basicConfig(
+    format="%(asctime)-15s [%(levelname)s] %(threadName)s in %(funcName)s: %(message)s",
+    level=logging.INFO,
+)
 
 ack_timeout = 0.25
 hash_size = 4 # number of bytes
@@ -24,7 +30,6 @@ def create_packet(seq_num: int, packet_type: bytes, payload: bytes) -> bytes:
     packet_wo_hash = packet_header_wo_hash + payload
     hash = shake(packet_wo_hash, hash_size)
     packet = hash + packet_wo_hash
-    # print(f"creating packet with hash {packet}")
     return packet
 
 def dissect_packet(packet: bytes):
@@ -48,21 +53,33 @@ class Streamer:
         self.dst_ip = dst_ip
         self.dst_port = dst_port
 
+        # Receive buffer:
+        # This buffer is used to hold all the packets received but not yet read
+        # by the application. This allows out-of-order packets to be stored.
+        # Semantically, it is a sliding window that starts at self.recv_seq_num
+        # with the given size. A given element is None if its corresponding
+        # packet has not yet been received.
+        self.recv_buff_condition = threading.Condition()
         self.recv_buff_size = 128
         self.recv_buff = [None for _ in range(self.recv_buff_size)]
-        self.recv_seq_num = 0 # the sequence number of the next packet expected by the receiver
+        self.recv_seq_num = 0 # the sequence number of the next packet to be sent to the application
+        self.received_fin = threading.Event()
 
-        self.send_buff_size = 128
+        # Send buffer:
+        # This buffer is used to hold all the packets that are awaiting ACKs.
+        # Semantically, it is a sliding window that starts at self.send_ack_num
+        # and ends at self.send_seq_num
+        # Every element between those two pointers is an in-flight packet.
+        # An element not between those pointers has no meaning.
+        self.send_buff_condition = threading.Condition()
+        self.send_buff_size = 2
         self.send_buff = [None for _ in range(self.send_buff_size)]
         self.send_seq_num = 0 # the sequence number of the next packet to be sent
         self.send_ack_num = 0 # the sequence number of next packet that is awaiting acknowledgement
-        self.send_got_ack = threading.Event()
-        self.send_packets_in_flight = threading.Event()
 
-        self.got_fin = threading.Event()
         self.closed = False
 
-        executor = ThreadPoolExecutor(max_workers=1)
+        executor = ThreadPoolExecutor(max_workers=2)
         executor.submit(self.listener)
         executor.submit(self.retransmitter)
 
@@ -74,14 +91,17 @@ class Streamer:
             yield create_packet(self.send_seq_num, b'D', payload)
 
     def send_packet(self, packet: bytes) -> None:
-        if self.send_seq_num - self.send_ack_num >= self.recv_buff_size:
-            # we have enough buffer space to send the packet
+        with self.send_buff_condition:
+            # wait until we have enough buffer space to send the packet
+            logging.info("waiting for send buffer space")
+            self.send_buff_condition.wait_for(lambda: self.send_seq_num - self.send_ack_num < self.send_buff_size)
+            logging.info("buffer space exists, doing a send")
+
             self.send_buff[self.send_seq_num % self.send_buff_size] = packet
-            self.socket.sendto(packet, (self.dst_ip, self.dst_port))
             self.send_seq_num += 1
-            self.send_packets_in_flight.set()
-        else:
-            pass # TODO what to do if the outgoing packet can't fit?
+            self.socket.sendto(packet, (self.dst_ip, self.dst_port))
+
+            self.send_buff_condition.notify_all()
 
     def send(self, data_bytes: bytes) -> None:
         """Note that data_bytes can be larger than one packet."""
@@ -93,18 +113,57 @@ class Streamer:
         """Blocks (waits) if no data is ready to be read from the connection."""
 
         result = b''
-        while self.recv_buff[(i := self.recv_seq_num % self.recv_buff_size)] is not None or not result:
-            if self.recv_buff[i] is None:
-                time.sleep(0.01)
-                continue
-            self.recv_seq_num += 1 # this happens before we modify recv_buff so that the listener thread never replaces a packet that's being removed
-            result += self.recv_buff[i]
-            self.recv_buff[i] = None
+        with self.recv_buff_condition:
+            # wait for the next packet to come
+            logging.info("waiting for the next expected packet to come")
+            self.recv_buff_condition.wait_for(lambda: self.recv_buff[self.recv_seq_num % self.recv_buff_size] is not None)
+            logging.info("got the next expected packet; retreiving for application")
+
+            while self.recv_buff[(i := self.recv_seq_num % self.recv_buff_size)] is not None:
+                self.recv_seq_num += 1
+                result += self.recv_buff[i]
+                self.recv_buff[i] = None
+
+            self.recv_buff_condition.notify_all()
         return result
 
+    def handle_received_data(self, seq_num, data: bytes):
+        with self.recv_buff_condition:
+            if seq_num < self.recv_seq_num + self.recv_buff_size:
+                # the received packet won't overflow the buffer
+
+                if self.recv_seq_num <= seq_num:
+                    # the received packet won't underflow the buffer; store it
+                    logging.info("storing data packet into buffer")
+                    self.recv_buff[seq_num % self.recv_buff_size] = data
+                    self.recv_buff_condition.notify_all()
+                else:
+                    logging.info("data packet is old; dropping")
+
+                # make a cumulative acknowledgement
+                ack_num = self.recv_seq_num
+                while self.recv_buff[ack_num % self.recv_buff_size] is not None:
+                    # TODO what if every element is not None?
+                    ack_num += 1
+                # acknowledge packet even if we already received it (maybe our ACK got lost)
+                logging.info("sending ACK")
+                ack = create_packet(ack_num, b'A', b'')
+                self.socket.sendto(ack, (self.dst_ip, self.dst_port))
+            else:
+                logging.info("data packet won't fit in the buffer; dropped")
+            # if the received packet can't fit or was already transmitted to the application, then drop it
+
+    def handle_received_ack(self, ack_num):
+        with self.send_buff_condition:
+            if ack_num > self.send_ack_num:
+                logging.info(f"ACK {ack_num}")
+                self.send_ack_num = ack_num
+                self.send_buff_condition.notify_all()
+
     def listener(self):
-        while not self.closed: # a later hint will explain self.closed
-            try:
+        try:
+            while not self.closed:
+                # get a good packet from the socket
                 packet, addr = self.socket.recvfrom()
                 if len(packet) == 0:
                     # the socket died
@@ -114,71 +173,68 @@ class Streamer:
                 if maybe_dissected_packet is None:
                     print("this data sucks")
                     continue
+
+                # act on the received packet
                 (seq_num, packet_type), data = maybe_dissected_packet
                 if packet_type == b'D':
-                    if seq_num < self.recv_seq_num + self.recv_buff_size:
-                        # the received packet won't overflow the buffer
-
-                        if self.recv_seq_num <= seq_num:
-                            # the received packet won't underflow the buffer; store it
-                            self.recv_buff[seq_num % self.recv_buff_size] = data
-
-                        # make a cumulative acknowledgement
-                        ack_num = self.recv_seq_num
-                        while self.recv_buff[ack_num % self.recv_buff_size] is not None:
-                            # TODO what if every element is not None?
-                            ack_num += 1
-                        # acknowledge packet even if we already received it (maybe our ACK got lost)
-                        ack = create_packet(ack_num + 1, b'A', b'')
-                        self.socket.sendto(ack, (self.dst_ip, self.dst_port))
-                    # if the received packet can't fit or was already transmitted to the application, then drop it
+                    self.handle_received_data(seq_num, data)
                 elif packet_type == b'A':
-                    if seq_num > self.send_ack_num:
-                        self.send_got_ack.set()
-                        self.send_ack_num = seq_num
+                    self.handle_received_ack(seq_num)
                 elif packet_type == b'F':
-                    self.got_fin.set()
-                    # acknowledge packet even if we already received it (maybe our ACK got lost)
-                    # TODO unify acking logic
-                    ack = create_packet(seq_num + 1, b'A', b'')
-                    self.socket.sendto(ack, (self.dst_ip, self.dst_port))
-                    print("got fin")
+                    self.received_fin.set()
+                    self.handle_received_data(seq_num, data)
                 else:
                     raise Exception(f"unknown packet type: {packet_type}")
-            except Exception as e:
-                print("listener died!")
-                print(e)
+        except Exception as e:
+            print("listener died!")
+            print(e)
 
     def retransmitter(self):
-        while not self.closed:
-            self.send_packets_in_flight.wait()
-            while self.send_ack_num < self.send_seq_num:
-                if self.send_got_ack.wait(timeout=ack_timeout):
-                    # packet was succesfully acknowledged
-                    self.send_got_ack.clear()
-                else:
-                    # timeout occurred, resend the oldest unACK'ed packet
-                    self.socket.sendto(self.send_buf[self.send_ack_num], (self.dst_ip, self.dst_port))
-            self.send_packets_in_flight.clear()
+        try:
+            with self.send_buff_condition:
+                while True:
+                    # wait for a packet to be sent
+                    print("retransmitter: waiting for a packet to be in flight")
+                    self.send_buff_condition.wait_for(lambda: self.send_ack_num < self.send_seq_num or self.closed)
+                    if self.closed: return
+                    print("retransmitter: packet in flight detected! starting timer")
+
+                    # wait for an ACK, but impatiently
+                    old_ack_num = self.send_ack_num
+                    got_ack = self.send_buff_condition.wait_for(lambda: self.send_ack_num > old_ack_num or self.closed, timeout=ack_timeout)
+                    if self.closed: return
+
+                    if got_ack:
+                        print("retransmitter: ACK received, restarting")
+                    else:
+                        print("retransmitter: no ACK received, retransmitting")
+                        # timeout occurred, resend the oldest unACK'ed packet
+                        self.socket.sendto(self.send_buff[self.send_ack_num % self.send_buff_size], (self.dst_ip, self.dst_port))
+        except Exception as e:
+            print("retransmitter died!")
+            print(e)
 
     def close(self) -> None:
         """Cleans up. It should block (wait) until the Streamer is done with all
            the necessary ACKs and retransmissions"""
-        # TODO at part 5 [Wait for any sent data packets to be ACKed. Actually, if you're doing stop-and-wait then you know all of your sent data has been ACKed. However, in Part 5 you'll add code to maybe wait here.]
-        # Send a FIN packet.
-        fin = create_packet(self.send_seq_num, b'F', b'')
-        # Wait for an ACK of the FIN packet. Go back to Step 2 if a timer expires.
-        # print("starting to send fin")
-        self.send_packet(fin) # blocks until ACK'ed
-        # print("finished fin")
-        # Wait until the listener records that a FIN packet was received from the other side.
-        self.got_fin.wait() # blocks forever until a FIN comes TODO can we not???
-        # Wait two seconds.
-        time.sleep(2.0)
-        # Stop the listener thread with self.closed = True and self.socket.stoprecv()
-        self.closed = True
-        self.socket.stoprecv()
-        # Finally, return from Streamer#close
+        with self.send_buff_condition:
+            # wait for every previous message to be acknowledged
+            self.send_buff_condition.wait_for(lambda: self.send_ack_num == self.send_seq_num)
+            # Send a FIN packet.
+            fin = create_packet(self.send_seq_num, b'F', b'')
+            self.send_packet(fin)
+            # Wait for an ACK of the FIN packet. Go back to Step 2 if a timer expires.
+            self.send_buff_condition.wait_for(lambda: self.send_ack_num == self.send_seq_num)
+            # Wait until the listener records that a FIN packet was received from the other side.
+            self.received_fin.wait() # blocks forever until a FIN comes TODO can we not???
+            # Wait two seconds.
+            time.sleep(2.0)
+            # Stop the other threads
+            self.closed = True
+            self.send_buff_condition.notify_all()
+            # no need to notify those waiting on the recv_buff_condition; no one waits on it anyway
+            self.socket.stoprecv()
+            # Finally, return from Streamer#close
         return
 
 def shake(data: bytes, length=hash_size):
