@@ -16,7 +16,8 @@ logging.basicConfig(
 logger = logging.getLogger()
 # logger.disabled = True
 
-ack_timeout = 0.25
+patient_ack_timeout = 0.25
+impatient_ack_timeout = 0.1
 send_empty_timeout = 0.1
 hash_size = 4 # number of bytes
 packet_size = 1472
@@ -72,12 +73,13 @@ class Streamer:
         # with the given size. self.recv_buff_valid determines which bytes
         # have been received.
         self.recv_buff_condition = threading.Condition()
-        self.recv_buff_size = 128
+        self.recv_buff_size = 2048
         self.recv_buff_bytes = bytearray(self.recv_buff_size) # stores the received bytes
         self.recv_buff_valid = [False] * self.recv_buff_size # stores which bytes are valid
         self.recv_seq_start = 0 # the sequence number of the next byte to be sent to the application
         # self.recv_seq_end = 0 # the sequence number of the first invalid byte
         self.received_fin = threading.Event()
+        self.received_data = threading.Event() # for pure ack'er
         # TODO make sure dropped fins get resent
 
         # Send buffer:
@@ -87,19 +89,21 @@ class Streamer:
         # and ends at self.send_seq_unused
         # An element not between those pointers has no meaning.
         self.send_buff_condition = threading.Condition()
-        self.send_buff_size = 64
+        self.send_buff_size = 2048
         self.send_buff = bytearray(self.send_buff_size)
         self.send_seq_unacked = 0 # the sequence number of next byte that is awaiting acknowledgement
         self.send_seq_unsent = 0 # the sequence number of the next byte to be sent
         self.send_seq_unused = 0 # the sequence number of the next byte to be used by the application
-        self.send_finished = False # is there a fin packet in fli
+        self.send_finished = False # is there a fin packet in flight
+        self.sent_anything = threading.Event() # for pure ack'er
 
         self.closed = False
 
-        executor = ThreadPoolExecutor(max_workers=3)
+        executor = ThreadPoolExecutor(max_workers=4)
         executor.submit(self.listener)
         executor.submit(self.transmitter)
         executor.submit(self.retransmitter)
+        executor.submit(self.pure_acker)
 
     # TODO doesn't need to be a method
     def chunketize(self, data_bytes: bytes):
@@ -159,9 +163,9 @@ class Streamer:
         result = b''
         with self.recv_buff_condition:
             # wait for the next packet to come
-            logging.info(f"waiting for #{self.recv_seq_start} to come")
+            # logging.info(f"waiting for #{self.recv_seq_start} to come")
             self.recv_buff_condition.wait_for(lambda: self.recv_buff_valid[self.recv_seq_start % self.recv_buff_size])
-            logging.info(f"got #{self.recv_seq_start}; retreiving for application")
+            # logging.info(f"got #{self.recv_seq_start}; retreiving for application")
 
             while self.recv_buff_valid[(i := self.recv_seq_start % self.recv_buff_size)]:
                 self.recv_seq_start += 1
@@ -174,31 +178,35 @@ class Streamer:
     def send_packet(self, send_seq_start, send_seq_end, packet_type):
         """creates and sends a packet where the payload is the contents of the send buffer between send_seq_start and send_seq_end"""
         # with self.send_buff_condition:
+        # all sent packets include the current ACK number, which implements piggy-backing
         ack_num = self.calc_ack_num()
-        logging.info(f"sending #{send_seq_start}-{send_seq_end} with ACK #{ack_num}")
+        logging.info(f"sending #{send_seq_start}-{send_seq_end} with ACK #{ack_num} and type {packet_type}")
         payload = get_slice(self.send_buff, send_seq_start, send_seq_end)
-        logging.info(payload)
+        # logging.info(payload)
         packet = create_packet(send_seq_start, ack_num, packet_type, payload)
         self.socket.sendto(packet, (self.dst_ip, self.dst_port))
+        self.sent_anything.set()
+        self.sent_anything.clear()
 
     def transmitter(self):
         try:
             with self.send_buff_condition:
                 while True:
-                    logging.info("waiting for packets to send")
+                    # logging.info("waiting for packets to send")
+                    # use Nagle's algorithm to combine small packets
                     self.send_buff_condition.wait_for(
-                        lambda: self.closed or self.send_seq_unused >= self.send_seq_unsent + payload_size or
-                            (self.send_seq_unsent < self.send_seq_unused and self.send_seq_unacked == self.send_seq_unsent)
+                        lambda: self.closed or self.send_seq_unused >= self.send_seq_unsent + payload_size or # max payload size is filled
+                            (self.send_seq_unsent < self.send_seq_unused and self.send_seq_unacked == self.send_seq_unsent) # we have data to send and are not waiting for ACKs on our own data
                     )
                     if self.closed: break
 
                     # send one packet and then enter the loop
                     end_seq = min(self.send_seq_unused, self.send_seq_unsent + payload_size)
-                    logging.info(f"initial send for #{self.send_seq_unsent}-{end_seq}")
+                    # logging.info(f"initial send for #{self.send_seq_unsent}-{end_seq}")
                     packet_type = b'F' if self.send_finished else b'D'
                     self.send_packet(self.send_seq_unsent, end_seq, packet_type)
                     self.send_seq_unsent = end_seq
-                self.send_buff_condition.notify_all()
+                    self.send_buff_condition.notify_all()
         except Exception as e:
             print("transmitter died!")
             print(e)
@@ -208,31 +216,30 @@ class Streamer:
     def handle_received_data(self, seq_num, ack_num, data: bytes):
         logging.info(f"handling incoming #{seq_num}-{seq_num + len(data)} with ack #{ack_num}")
 
-        # fast ack a received fin
-        if self.received_fin.is_set():
-            logging.info("fast-acking a received FIN")
-            self.send_packet(self.send_seq_unsent, self.send_seq_unsent, b'D')
-
+        if len(data) > 0:
+            self.received_data.set()
+            self.received_data.clear()
+        logging.info("waiting for send_buff_condition")
         with self.send_buff_condition:
             if ack_num > self.send_seq_unacked:
                 logging.info(f"got ACK {ack_num}")
                 self.send_seq_unacked = ack_num
                 self.send_buff_condition.notify_all() # TODO this might be why we're not seeing ACKs
-
+        logging.info('waiting for recv_buff_condition')
         with self.recv_buff_condition:
             if seq_num < self.recv_seq_start + self.recv_buff_size:
                 # the received packet won't overflow the buffer
 
                 if self.recv_seq_start <= seq_num:
                     # the received packet won't underflow the buffer; store it
-                    logging.info("storing data packet into buffer")
+                    # logging.info("storing data packet into buffer")
                     for i in range(len(data)):
                         s = seq_num + i
                         self.recv_buff_bytes[s % self.recv_buff_size] = data[i]
                         self.recv_buff_valid[s % self.recv_buff_size] = True
                     self.recv_buff_condition.notify_all()
-                else:
-                    logging.info("data packet is old; dropping")
+                # else:
+                    # logging.info("data packet is old; dropping")
 
                 # make a cumulative acknowledgement
                 # ack_num = self.recv_seq_start
@@ -243,19 +250,31 @@ class Streamer:
                 # logging.info(f"sending ACK for #{ack_num}")
                 # ack = create_packet(ack_num, b'A', b'')
                 # self.socket.sendto(ack, (self.dst_ip, self.dst_port))
-            else:
-                logging.info("data packet won't fit in the buffer; dropped")
+            # else:
+                # logging.info("data packet won't fit in the buffer; dropped")
             # if the received packet can't fit or was already transmitted to the application, then drop it
+        # TODO: never gets here for FINs only
+
+        logging.info("HI THERE")
+
+        # fast ack a received fin
+        if self.received_fin.is_set():
+            logging.info("fast-acking a received FIN")
+            self.send_packet(self.send_seq_unsent, self.send_seq_unsent, b'D')
 
     def listener(self):
         try:
             while not self.closed:
                 # get a good packet from the socket
+                logging.info("abt to ask socket for stuff")
                 packet, addr = self.socket.recvfrom()
+                logging.info("got literally any packet")
                 if len(packet) == 0:
                     # the socket died
+                    logging.info("aight imma head out")
                     break
                 assert(len(packet) <= packet_size) # pretty sure self.socket.recvfrom() returns only one packet
+                logging.info("sdfjlsdjf")
                 maybe_dissected_packet = dissect_packet(packet)
                 if maybe_dissected_packet is None:
                     logging.info("got corrupted packet; ignoring")
@@ -266,6 +285,7 @@ class Streamer:
                 if packet_type == b'D': # includes pure ACKs
                     self.handle_received_data(seq_num, ack_num, data)
                 elif packet_type == b'F':
+                    logging.info("i see your fin")
                     self.received_fin.set()
                     self.handle_received_data(seq_num, ack_num, data)
                 else:
@@ -281,20 +301,15 @@ class Streamer:
             with self.send_buff_condition:
                 while True:
                     # wait for a packet to be sent
-                    logging.info("waiting for a packet to be in flight")
-                    packet_in_flight = self.send_buff_condition.wait_for(lambda: self.send_seq_unacked < self.send_seq_unsent or self.closed, timeout=send_empty_timeout)
+                    # logging.info("waiting for a packet to be in flight")
+                    self.send_buff_condition.wait_for(lambda: self.send_seq_unacked < self.send_seq_unsent or self.closed)
                     if self.closed: break
-                    if not packet_in_flight:
-                        if not self.received_fin.is_set(): # don't do periodic ACKs because we're already fast-acking
-                            logging.info("no outgoing packets, sending an empty ACK")
-                            # send an empty packet just to ACK
-                            self.send_packet(self.send_seq_unsent, self.send_seq_unsent, b'D')
-                        continue
 
-                    logging.info(f"packet in flight detected! starting timer for #{self.send_seq_unacked}")
+                    # logging.info(f"packet in flight detected! starting timer for #{self.send_seq_unacked}")
                     # wait for an ACK, but impatiently
-                    old_ack_num = self.send_seq_unacked # TODO: see if prayer (byte seq nums) fixed this
-                    got_ack = self.send_buff_condition.wait_for(lambda: self.send_seq_unacked > old_ack_num or self.closed, timeout=ack_timeout)
+                    old_ack_num = self.send_seq_unacked
+                    acktual_timeout = impatient_ack_timeout if self.send_finished else patient_ack_timeout
+                    got_ack = self.send_buff_condition.wait_for(lambda: self.send_seq_unacked > old_ack_num or self.closed, timeout=acktual_timeout)
                     if self.closed: break
 
                     if got_ack:
@@ -307,6 +322,31 @@ class Streamer:
                         self.send_packet(self.send_seq_unacked, end_seq, packet_type)
         except Exception as e:
             print("retransmitter died!")
+            print(e)
+        finally:
+            logging.info("good night.")
+
+    def pure_acker(self) -> None:
+        try:
+            while True:
+                # wait for data to be received
+                # logging.info("waiting for data to be received")
+                self.received_data.wait()
+                if self.closed: break
+
+                # wait for EITHER: timeout occurs OR another thread has sent data
+                # logging.info("looks like we got data. waiting for either timeout or another thread to send")
+                other_thread_has_sent = self.sent_anything.wait(timeout=send_empty_timeout)
+                if self.closed: break
+
+                if not other_thread_has_sent and not self.received_fin.is_set():
+                    # send pure ACK
+                    logging.info("sending an empty ACK")
+                    self.send_packet(self.send_seq_unsent, self.send_seq_unsent, b'D') # TODO get the lock first
+                else:
+                    logging.info("someone has ACKed for us; do nothing")
+        except Exception as e:
+            print("pure_acker died")
             print(e)
         finally:
             logging.info("good night.")
@@ -327,18 +367,21 @@ class Streamer:
             logging.info("waiting for ACK of FIN")
             self.send_buff_condition.wait_for(lambda: self.send_seq_unacked == self.send_seq_unused)
             logging.info("ACK of FIN received")
-            # Wait until the listener records that a FIN packet was received from the other side.
-            logging.info("waiting for FIN from the other side")
-            self.received_fin.wait() # blocks forever until a FIN comes
-            logging.info("FIN received; starting grace period")
-            # Wait two seconds.
-            time.sleep(2.0)
-            logging.info("grace period over. good night.")
-            # Stop the other threads
-            self.closed = True
+        # Wait until the listener records that a FIN packet was received from the other side.
+        logging.info("waiting for FIN from the other side")
+        self.received_fin.wait() # blocks forever until a FIN comes
+        logging.info("FIN received; starting grace period")
+        # Wait two seconds.
+        time.sleep(2.0)
+        logging.info("grace period over. good night.")
+        # Stop the other threads
+        self.closed = True
+        with self.send_buff_condition:
             self.send_buff_condition.notify_all()
-            # no need to notify those waiting on the recv_buff_condition; no one waits on it anyway
-            self.socket.stoprecv()
+        # no need to notify those waiting on the recv_buff_condition; no one waits on it anyway
+        self.received_data.set() # to kill waiting threads
+        self.sent_anything.set() # to kill waiting threads
+        self.socket.stoprecv()
             # Finally, return from Streamer#close
         return
 
