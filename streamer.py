@@ -14,7 +14,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger()
-logger.disabled = True
+# logger.disabled = True
 
 ack_timeout = 0.25
 send_empty_timeout = 0.1
@@ -92,6 +92,7 @@ class Streamer:
         self.send_seq_unacked = 0 # the sequence number of next byte that is awaiting acknowledgement
         self.send_seq_unsent = 0 # the sequence number of the next byte to be sent
         self.send_seq_unused = 0 # the sequence number of the next byte to be used by the application
+        self.send_finished = False # is there a fin packet in fli
 
         self.closed = False
 
@@ -194,7 +195,8 @@ class Streamer:
                     # send one packet and then enter the loop
                     end_seq = min(self.send_seq_unused, self.send_seq_unsent + payload_size)
                     logging.info(f"initial send for #{self.send_seq_unsent}-{end_seq}")
-                    self.send_packet(self.send_seq_unsent, end_seq, b'D')
+                    packet_type = b'F' if self.send_finished else b'D'
+                    self.send_packet(self.send_seq_unsent, end_seq, packet_type)
                     self.send_seq_unsent = end_seq
                 self.send_buff_condition.notify_all()
         except Exception as e:
@@ -205,15 +207,19 @@ class Streamer:
 
     def handle_received_data(self, seq_num, ack_num, data: bytes):
         logging.info(f"handling incoming #{seq_num}-{seq_num + len(data)} with ack #{ack_num}")
+
+        # fast ack a received fin
+        if self.received_fin.is_set():
+            logging.info("fast-acking a received FIN")
+            self.send_packet(self.send_seq_unsent, self.send_seq_unsent, b'D')
+
         with self.send_buff_condition:
-            logging.info("a")
             if ack_num > self.send_seq_unacked:
                 logging.info(f"got ACK {ack_num}")
                 self.send_seq_unacked = ack_num
                 self.send_buff_condition.notify_all() # TODO this might be why we're not seeing ACKs
-        logging.info("b")
+
         with self.recv_buff_condition:
-            logging.info("c")
             if seq_num < self.recv_seq_start + self.recv_buff_size:
                 # the received packet won't overflow the buffer
 
@@ -279,9 +285,10 @@ class Streamer:
                     packet_in_flight = self.send_buff_condition.wait_for(lambda: self.send_seq_unacked < self.send_seq_unsent or self.closed, timeout=send_empty_timeout)
                     if self.closed: break
                     if not packet_in_flight:
-                        logging.info("no outgoing packets, sending an empty ACK")
-                        # send an empty packet just to ACK
-                        self.send_packet(self.send_seq_unsent, self.send_seq_unsent, b'D')
+                        if not self.received_fin.is_set(): # don't do periodic ACKs because we're already fast-acking
+                            logging.info("no outgoing packets, sending an empty ACK")
+                            # send an empty packet just to ACK
+                            self.send_packet(self.send_seq_unsent, self.send_seq_unsent, b'D')
                         continue
 
                     logging.info(f"packet in flight detected! starting timer for #{self.send_seq_unacked}")
@@ -296,7 +303,8 @@ class Streamer:
                         logging.info(f"no ACK received, retransmitting #{self.send_seq_unacked}")
                         # timeout occurred, resend the oldest unACK'ed bytes
                         end_seq = min(self.send_seq_unsent, self.send_seq_unacked + payload_size)
-                        self.send_packet(self.send_seq_unacked, end_seq, b'D')
+                        packet_type = b'F' if self.send_finished else b'D'
+                        self.send_packet(self.send_seq_unacked, end_seq, packet_type)
         except Exception as e:
             print("retransmitter died!")
             print(e)
@@ -309,18 +317,19 @@ class Streamer:
         with self.send_buff_condition:
             # wait for every previous message to be acknowledged
             logging.info("waiting for all packets to be acknowledged before sending FIN")
-            self.send_buff_condition.wait_for(lambda: self.send_seq_unacked == self.send_seq_unsent)
-            logging.info(f"all packets acknowledged, sending FIN as #{self.send_seq_unsent}")
+            self.send_buff_condition.wait_for(lambda: self.send_seq_unacked == self.send_seq_unused)
+            logging.info(f"all packets acknowledged, sending FIN as #{self.send_seq_unused}")
             # Send a FIN packet.
-            fin = create_packet(self.send_seq_unsent, b'F', b'')
-            self.send_packet(fin)
+            self.send_finished = True
+            self.send(b'\0')
+            # transmitter takes care of sending a fin with an empty byte (from send buffer) as the payload
             # Wait for an ACK of the FIN packet. Go back to Step 2 if a timer expires.
             logging.info("waiting for ACK of FIN")
-            self.send_buff_condition.wait_for(lambda: self.send_seq_unacked == self.send_seq_unsent)
+            self.send_buff_condition.wait_for(lambda: self.send_seq_unacked == self.send_seq_unused)
             logging.info("ACK of FIN received")
             # Wait until the listener records that a FIN packet was received from the other side.
             logging.info("waiting for FIN from the other side")
-            self.received_fin.wait() # blocks forever until a FIN comes TODO can we not???
+            self.received_fin.wait() # blocks forever until a FIN comes
             logging.info("FIN received; starting grace period")
             # Wait two seconds.
             time.sleep(2.0)
