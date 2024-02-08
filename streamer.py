@@ -20,7 +20,7 @@ ack_timeout = 0.25
 send_empty_timeout = 0.1
 hash_size = 4 # number of bytes
 packet_size = 1472
-packet_header_format_wo_hash = f"!IIc" # 3-byte md5 hash, 4-byte sequence number
+packet_header_format_wo_hash = f"!IIc" # 4-byte sequence number, 4-byte ACK number
 packet_header_size = hash_size + struct.calcsize(packet_header_format_wo_hash)
 payload_size = packet_size - packet_header_size
 assert(payload_size > 0)
