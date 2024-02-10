@@ -70,9 +70,6 @@ class Streamer:
         self.dst_ip = dst_ip
         self.dst_port = dst_port
 
-        # TODO ensure that it's correctly documented what gets guarded
-        # by the conditions
-
         # Receive buffer:
         # This buffer is used to hold all the bytes received but not yet read
         # by the application. This allows out-of-order bytes to be stored.
@@ -84,6 +81,7 @@ class Streamer:
         self.recv_buff_bytes = bytearray(self.recv_buff_size) # stores the received bytes
         self.recv_buff_valid = [False] * self.recv_buff_size # stores which bytes are valid
         self.recv_seq_start = 0 # the sequence number of the next byte to be sent to the application
+        self.recv_seq_invalid = 0 # the sequence number of the next unreceived byte in the stream
 
         self.received_fin = threading.Event()
         self.received_data = threading.Event() # for pure ACKer
@@ -100,27 +98,17 @@ class Streamer:
         self.send_seq_unacked = 0 # the sequence number of next byte that is awaiting acknowledgement
         self.send_seq_unsent = 0 # the sequence number of the next byte to be sent
         self.send_seq_unused = 0 # the sequence number of the next byte to be used by the application
-        self.send_finished = False # is there a fin packet in flight
+        self.send_finished = False # whether the application might have more data to send
 
-        self.sent_anything = threading.Event() # for pure ack'er
+        self.sent_anything = threading.Event() # for pure ack'er to know whether he needs to send the occasional ACK
 
         self.closed = False
 
-        # TODO make this just start separate threads without an executor
         executor = ThreadPoolExecutor(max_workers=4)
         executor.submit(self.listener)
         executor.submit(self.transmitter)
         executor.submit(self.retransmitter)
         executor.submit(self.pure_acker)
-
-    def calc_ack_num(self):
-        """Returns the ack num to be send with all outgoing packets from this streamer."""
-        with self.recv_buff_condition:
-            ack_num = self.recv_seq_start
-            while self.recv_buff_valid[ack_num % self.recv_buff_size]:
-                # TODO what if every element is not None?
-                ack_num += 1
-        return ack_num
 
     def send(self, data_bytes: bytes) -> None:
         """Note that data_bytes can be larger than one packet.
@@ -149,28 +137,28 @@ class Streamer:
     def recv(self) -> bytes:
         """Blocks (waits) if no data is ready to be read from the connection."""
 
-        result = b''
         with self.recv_buff_condition:
             # wait for the next packet to come
             logging.info(f"waiting for #{self.recv_seq_start}")
-            self.recv_buff_condition.wait_for(lambda: self.recv_buff_valid[self.recv_seq_start % self.recv_buff_size])
+            self.recv_buff_condition.wait_for(lambda: self.recv_seq_invalid > self.recv_seq_start)
             logging.info(f"found #{self.recv_seq_start}; retreiving for application")
 
-            while self.recv_buff_valid[(i := self.recv_seq_start % self.recv_buff_size)]:
-                self.recv_seq_start += 1
-                result += self.recv_buff_bytes[i:(i + 1)]
-                self.recv_buff_valid[i] = False
+            result = get_slice(self.recv_buff_bytes, self.recv_seq_start, self.recv_seq_invalid)
+            self.recv_seq_start = self.recv_seq_invalid
+            for seq in range(self.recv_seq_start, self.recv_seq_invalid):
+                self.recv_buff_valid[seq % self.recv_buff_size] = False
 
             self.recv_buff_condition.notify_all()
         return result
 
     def send_packet(self, send_seq_start: int, send_seq_end: int, packet_type: bytes):
         """creates and sends a packet where the payload is the contents of the send buffer between send_seq_start and send_seq_end"""
+        # all sent packets include the current ACK number, which implements piggy-backing
+        with self.recv_buff_condition:
+            ack_num = self.recv_seq_invalid
         with self.send_buff_condition:
-            # all sent packets include the current ACK number, which implements piggy-backing
-            ack_num = self.calc_ack_num()
             payload = get_slice(self.send_buff, send_seq_start, send_seq_end)
-            packet = create_packet(send_seq_start, ack_num, packet_type, payload)
+        packet = create_packet(send_seq_start, ack_num, packet_type, payload)
         logging.info(f"sending #{send_seq_start}-{send_seq_end} with ACK #{ack_num} and type {packet_type}: {payload}")
         self.socket.sendto(packet, (self.dst_ip, self.dst_port))
         self.sent_anything.set()
@@ -219,9 +207,13 @@ class Streamer:
                     # the received packet won't underflow the buffer; store it
                     # logging.info("storing data packet into buffer")
                     for i in range(len(data)):
-                        s = seq_num + i
-                        self.recv_buff_bytes[s % self.recv_buff_size] = data[i]
-                        self.recv_buff_valid[s % self.recv_buff_size] = True
+                        s = seq_num + i # the sequence number of this single byte
+                        j = s % self.recv_buff_size # the location in the receive buffer of this single byte
+                        self.recv_buff_bytes[j] = data[i]
+                        self.recv_buff_valid[j] = True
+                        if self.recv_seq_invalid == s:
+                            self.recv_seq_invalid += 1
+
                     self.recv_buff_condition.notify_all()
                 else:
                     logging.info("data packet is old; dropping")
