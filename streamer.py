@@ -306,6 +306,7 @@ class Streamer:
                 if self.closed: break
 
                 # wait for EITHER: timeout occurs OR another thread has sent data
+                # using timeout instead of immediately ACKing when data is received implements delayed ACKs
                 logging.info("found received data; waiting for either timeout or another thread to send")
                 other_thread_has_sent = self.sent_anything.wait(timeout=send_empty_timeout)
                 if self.closed: break
