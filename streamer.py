@@ -1,3 +1,8 @@
+# EXTRA CREDIT ATTEMPT
+# - piggy-backed ACKs on line 163
+# - delayed ACKs on line 314
+# - Nagle's Algorithm on line 183
+
 # do not import anything else from loss_socket besides LossyUDP
 from lossy_socket import LossyUDP
 # do not import anything else from socket except INADDR_ANY
