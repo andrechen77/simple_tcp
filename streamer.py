@@ -78,7 +78,7 @@ class Streamer:
         # with the given size. self.recv_buff_valid determines which bytes
         # have been received.
         self.recv_buff_condition = threading.Condition() # guards access to all variables in this group
-        self.recv_buff_size = 2048
+        self.recv_buff_size = 8192
         self.recv_buff_bytes = bytearray(self.recv_buff_size) # stores the received bytes
         self.recv_buff_valid = [False] * self.recv_buff_size # stores which bytes are valid
         self.recv_seq_start = 0 # the sequence number of the next byte to be sent to the application
@@ -94,7 +94,7 @@ class Streamer:
         # and ends at self.send_seq_unused
         # An element not between those pointers has no meaning.
         self.send_buff_condition = threading.Condition() # guards access to all variables in this group
-        self.send_buff_size = 2048
+        self.send_buff_size = 8192
         self.send_buff = bytearray(self.send_buff_size)
         self.send_seq_unacked = 0 # the sequence number of next byte that is awaiting acknowledgement
         self.send_seq_unsent = 0 # the sequence number of the next byte to be sent
