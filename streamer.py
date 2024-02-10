@@ -8,6 +8,7 @@ import time
 import threading
 import hashlib
 import logging
+from typing import Optional
 
 logging.basicConfig(
     format="%(asctime)-15s [%(levelname)s] %(threadName)s in %(funcName)s:\n\t%(message)s",
@@ -16,7 +17,7 @@ logging.basicConfig(
 logger = logging.getLogger()
 logger.disabled = True
 
-patient_ack_timeout = 0.5
+patient_ack_timeout = 0.25
 impatient_ack_timeout = 0.1
 send_empty_timeout = 0.1
 hash_size = 4 # number of bytes
@@ -142,22 +143,27 @@ class Streamer:
             # wait for the next packet to come
             logging.info(f"waiting for #{self.recv_seq_start}")
             self.recv_buff_condition.wait_for(lambda: self.recv_seq_invalid > self.recv_seq_start)
-            logging.info(f"found #{self.recv_seq_start}; retreiving for application")
+            logging.info(f"found #{self.recv_seq_start}; retrieving for application")
 
             result = get_slice(self.recv_buff_bytes, self.recv_seq_start, self.recv_seq_invalid)
-            self.recv_seq_start = self.recv_seq_invalid
             for seq in range(self.recv_seq_start, self.recv_seq_invalid):
                 self.recv_buff_valid[seq % self.recv_buff_size] = False
+            self.recv_seq_start = self.recv_seq_invalid
 
             self.recv_buff_condition.notify_all()
         return result
 
-    def send_packet(self, send_seq_start: int, send_seq_end: int, packet_type: bytes):
+    def send_packet(self, packet_type: bytes, send_seq_bounds: Optional[tuple[int, int]]):
         """creates and sends a packet where the payload is the contents of the send buffer between send_seq_start and send_seq_end"""
         # all sent packets include the current ACK number, which implements piggy-backing
         with self.recv_buff_condition:
             ack_num = self.recv_seq_invalid
         with self.send_buff_condition:
+            if send_seq_bounds is None:
+                send_seq_start = self.send_seq_unsent
+                send_seq_end = self.send_seq_unsent
+            else:
+                send_seq_start, send_seq_end = send_seq_bounds
             payload = get_slice(self.send_buff, send_seq_start, send_seq_end)
         packet = create_packet(send_seq_start, ack_num, packet_type, payload)
         logging.info(f"sending #{send_seq_start}-{send_seq_end} with ACK #{ack_num} and type {packet_type}: {payload}")
@@ -180,7 +186,7 @@ class Streamer:
                     # send one packet and then enter the loop
                     end_seq = min(self.send_seq_unused, self.send_seq_unsent + payload_size)
                     packet_type = b'F' if self.send_finished else b'D'
-                    self.send_packet(self.send_seq_unsent, end_seq, packet_type)
+                    self.send_packet(packet_type, (self.send_seq_unsent, end_seq))
                     self.send_seq_unsent = end_seq
                     self.send_buff_condition.notify_all()
         except Exception as e:
@@ -210,8 +216,13 @@ class Streamer:
                         j = s % self.recv_buff_size # the location in the receive buffer of this single byte
                         self.recv_buff_bytes[j] = data[i]
                         self.recv_buff_valid[j] = True
-                        if self.recv_seq_invalid == s:
-                            self.recv_seq_invalid += 1
+
+                    while self.recv_buff_valid[self.recv_seq_invalid % self.recv_buff_size]:
+                        self.recv_seq_invalid += 1
+
+                        # to prevent infinite looping if every byte happens to be valid
+                        if self.recv_seq_invalid >= self.recv_seq_start + self.recv_buff_size:
+                            break
 
                     self.recv_buff_condition.notify_all()
                 else:
@@ -219,10 +230,10 @@ class Streamer:
             else:
                 logging.info("data packet won't fit in the receive buffer; dropping")
 
-            # fast ack a received fin
-            if self.received_fin.is_set():
-                logging.info("fast-acking a received FIN")
-                self.send_packet(self.send_seq_unsent, self.send_seq_unsent, b'D')
+        # fast ack a received fin
+        if self.received_fin.is_set():
+            logging.info("fast-acking a received FIN")
+            self.send_packet(b'D', None)
 
     def listener(self):
         try:
@@ -276,12 +287,11 @@ class Streamer:
                     if got_ack:
                         logging.info(f"ACK #{self.send_seq_unacked} received")
                     else:
-                        print("retransmitting packet")
                         logging.info(f"no ACK received, retransmitting #{self.send_seq_unacked}")
                         # timeout occurred, resend the oldest unACK'ed bytes
                         end_seq = min(self.send_seq_unsent, self.send_seq_unacked + payload_size)
                         packet_type = b'F' if self.send_finished else b'D'
-                        self.send_packet(self.send_seq_unacked, end_seq, packet_type)
+                        self.send_packet(packet_type, (self.send_seq_unacked, end_seq))
         except Exception as e:
             logging.exception("retransmitter died!")
         finally:
@@ -303,8 +313,7 @@ class Streamer:
                 if not other_thread_has_sent and not self.received_fin.is_set():
                     # send pure ACK
                     logging.info("timed out; sending an empty ACK")
-                    with self.send_buff_condition:
-                        self.send_packet(self.send_seq_unsent, self.send_seq_unsent, b'D')
+                    self.send_packet(b'D', None)
                 else:
                     logging.info("someone has ACKed for us; do nothing")
         except Exception as e:
